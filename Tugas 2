@@ -1,0 +1,216 @@
+import time
+import math
+import matplotlib.pyplot as plt
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+
+# =========================
+# Optional stop key for Windows
+# tombol '=' untuk stop
+# =========================
+try:
+    import msvcrt
+
+    def stop_pressed():
+        if msvcrt.kbhit():
+            key = msvcrt.getch()
+            try:
+                return key.decode("utf-8") == "="
+            except:
+                return False
+        return False
+
+except ImportError:
+    # fallback kalau bukan Windows
+    def stop_pressed():
+        return False
+
+
+# =========================
+# 1. Connect to CoppeliaSim
+# =========================
+client = RemoteAPIClient()
+sim = client.require('sim')
+
+# =========================
+# 2. Get robot and motors
+# =========================
+p3dx = sim.getObject('/PioneerP3DX')
+p3dx_RW = sim.getObject('/PioneerP3DX/rightMotor')
+p3dx_LW = sim.getObject('/PioneerP3DX/leftMotor')
+
+# =========================
+# 3. Robot parameters
+# sesuai slide
+# =========================
+rw = 0.195 / 2   # wheel radius
+rb = 0.381 / 2   # half wheel base / body radius
+
+# =========================
+# 4. Variables for method 1
+# pakai orientation dari simulator
+# =========================
+x_pose_ori = 0.0
+y_pose_ori = 0.0
+x_list_ori = []
+y_list_ori = []
+
+# =========================
+# 5. Variables for method 2
+# pakai integrasi angular velocity
+# =========================
+theta_int = 0.0
+x_pose_int = 0.0
+y_pose_int = 0.0
+x_list_int = []
+y_list_int = []
+
+# simpan theta juga kalau ingin dicek
+theta_list_ori = []
+theta_list_int = []
+time_list = []
+
+# =========================
+# 6. Start simulation
+# =========================
+sim.startSimulation()
+print("Simulation started")
+print("Tekan '=' untuk stop")
+
+time.sleep(0.2)
+
+start_time = time.time()
+prev_time = start_time
+
+try:
+    while True:
+        current_time = time.time()
+        elapsed = current_time - start_time
+        dt = current_time - prev_time
+        prev_time = current_time
+
+        if dt <= 0:
+            continue
+
+        # =========================
+        # Stop by keyboard '='
+        # =========================
+        if stop_pressed():
+            print("\nTombol '=' ditekan. Menghentikan simulasi...")
+            break
+
+        # =========================
+        # 7. Read wheel velocities
+        # sesuai slide yang dipakai adalah target velocity
+        # =========================
+        wr_vel = sim.getJointTargetVelocity(p3dx_RW)
+        wl_vel = sim.getJointTargetVelocity(p3dx_LW)
+
+        # =========================
+        # 8. Body velocity
+        # revision from slide
+        # =========================
+        vx = (wr_vel + wl_vel) * rw / 2.0
+        wx = (wr_vel - wl_vel) * rw / rb
+
+        # =========================
+        # METHOD 1
+        # pakai orientation bawaan simulator
+        # =========================
+        theta_ori = sim.getObjectOrientation(p3dx, sim.handle_world)[2]
+
+        x_dot_ori = vx * math.cos(theta_ori)
+        y_dot_ori = vx * math.sin(theta_ori)
+
+        x_pose_ori += x_dot_ori * dt
+        y_pose_ori += y_dot_ori * dt
+
+        x_list_ori.append(x_pose_ori)
+        y_list_ori.append(y_pose_ori)
+
+        # =========================
+        # METHOD 2
+        # pakai integrasi angular velocity
+        # theta_dot = wx
+        # =========================
+        theta_int += wx * dt
+
+        x_dot_int = vx * math.cos(theta_int)
+        y_dot_int = vx * math.sin(theta_int)
+
+        x_pose_int += x_dot_int * dt
+        y_pose_int += y_dot_int * dt
+
+        x_list_int.append(x_pose_int)
+        y_list_int.append(y_pose_int)
+
+        # =========================
+        # Save history
+        # =========================
+        theta_list_ori.append(theta_ori)
+        theta_list_int.append(theta_int)
+        time_list.append(elapsed)
+
+        # tampilkan info singkat
+        print(
+            f"t={elapsed:6.2f}s | wr={wr_vel:6.2f} | wl={wl_vel:6.2f} | "
+            f"vx={vx:6.3f} | wx={wx:6.3f}",
+            end="\r"
+        )
+
+        # biar loop tidak terlalu berat
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    print("\nProgram dihentikan dengan keyboard interrupt")
+
+finally:
+    # =========================
+    # 9. Stop simulation
+    # =========================
+    sim.stopSimulation()
+    print("\nSimulation stopped")
+
+    # tunggu sebentar agar state benar benar berhenti
+    time.sleep(0.5)
+
+    # =========================
+    # 10. Plot result
+    # =========================
+    plt.figure(figsize=(7, 6))
+    plt.plot(x_list_ori, y_list_ori, label='Using simulator orientation')
+    plt.xlabel('X Position (m)')
+    plt.ylabel('Y Position (m)')
+    plt.title('P3DX Path Using Orientation Data')
+    plt.axis('equal')
+    plt.grid(True)
+    plt.legend()
+
+    plt.figure(figsize=(7, 6))
+    plt.plot(x_list_int, y_list_int, label='Using angular velocity integration')
+    plt.xlabel('X Position (m)')
+    plt.ylabel('Y Position (m)')
+    plt.title('P3DX Path Using Angular Velocity Integration')
+    plt.axis('equal')
+    plt.grid(True)
+    plt.legend()
+
+    plt.figure(figsize=(7, 6))
+    plt.plot(x_list_ori, y_list_ori, label='Orientation data')
+    plt.plot(x_list_int, y_list_int, '--', label='Angular velocity integration')
+    plt.xlabel('X Position (m)')
+    plt.ylabel('Y Position (m)')
+    plt.title('Comparison of P3DX Paths')
+    plt.axis('equal')
+    plt.grid(True)
+    plt.legend()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(time_list, theta_list_ori, label='Theta from simulator')
+    plt.plot(time_list, theta_list_int, '--', label='Theta from integration')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Theta (rad)')
+    plt.title('Orientation Comparison')
+    plt.grid(True)
+    plt.legend()
+
+    plt.show()
