@@ -1,0 +1,148 @@
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import keyboard
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+
+
+# =========================
+# 1. Connect to CoppeliaSim
+# =========================
+client = RemoteAPIClient()
+sim = client.require('sim')
+
+# =========================
+# 2. Get Pioneer P3DX motors
+# =========================
+p3dx_RW = sim.getObject('/PioneerP3DX/rightMotor')
+p3dx_LW = sim.getObject('/PioneerP3DX/leftMotor')
+
+# Robot parameters from the class slide
+rw = 0.195 / 2
+rb = 0.381 / 2
+
+# =========================
+# 3. Data containers
+# =========================
+t_data = []
+wr_data = []
+wl_data = []
+vx_data = []
+omega_data = []
+
+# =========================
+# 4. Start simulation
+# =========================
+sim.startSimulation()
+print('Simulation started')
+print("Press '=' to stop the program early")
+
+time.sleep(0.2)
+
+start_time = time.time()
+duration = 20.0
+sample_time = 0.05
+
+try:
+    while True:
+        current_time = time.time() - start_time
+
+        # stop if duration reached
+        if current_time > duration:
+            print("\nTime limit reached")
+            break
+
+        # stop if '=' key is pressed
+        if keyboard.is_pressed('='):
+            print("\nProgram stopped by user with '='")
+            break
+
+        # Read joint angular velocities
+        wr_vel = sim.getJointTargetVelocity(p3dx_RW)
+        wl_vel = sim.getJointTargetVelocity(p3dx_LW)
+
+        # Compute body velocities
+        vr = wr_vel * rw
+        vl = wl_vel * rw
+
+        vx = (vr + vl) / 2.0
+        omega = (vr - vl) / rb
+
+        # Store data
+        t_data.append(current_time)
+        wr_data.append(wr_vel)
+        wl_data.append(wl_vel)
+        vx_data.append(vx)
+        omega_data.append(omega)
+
+        print(
+            f"t={current_time:5.2f} s | "
+            f"wr={wr_vel:6.3f} rad/s | "
+            f"wl={wl_vel:6.3f} rad/s | "
+            f"vx={vx:6.3f} m/s | "
+            f"omega={omega:6.3f} rad/s",
+            end='\r'
+        )
+
+        time.sleep(sample_time)
+
+finally:
+    sim.stopSimulation()
+    print('\nSimulation stopped')
+
+# =========================
+# 5. Convert to numpy arrays
+# =========================
+t_data = np.array(t_data)
+wr_data = np.array(wr_data)
+wl_data = np.array(wl_data)
+vx_data = np.array(vx_data)
+omega_data = np.array(omega_data)
+
+# avoid plotting if no data
+if len(t_data) > 0:
+    # =========================
+    # 6. Plot joint velocities
+    # =========================
+    plt.figure(figsize=(10, 6))
+
+    plt.subplot(2, 1, 1)
+    plt.plot(t_data, wr_data)
+    plt.xlabel('Time (s)')
+    plt.ylabel(r'$\dot{\phi}_R$ (rad/s)')
+    plt.title('Temporal Plot of Right Joint Velocity')
+    plt.grid(True)
+
+    plt.subplot(2, 1, 2)
+    plt.plot(t_data, wl_data)
+    plt.xlabel('Time (s)')
+    plt.ylabel(r'$\dot{\phi}_L$ (rad/s)')
+    plt.title('Temporal Plot of Left Joint Velocity')
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    # =========================
+    # 7. Plot body velocities
+    # =========================
+    plt.figure(figsize=(10, 6))
+
+    plt.subplot(2, 1, 1)
+    plt.plot(t_data, vx_data)
+    plt.xlabel('Time (s)')
+    plt.ylabel(r'$V_x$ (m/s)')
+    plt.title('Temporal Plot of Body Linear Velocity')
+    plt.grid(True)
+
+    plt.subplot(2, 1, 2)
+    plt.plot(t_data, omega_data)
+    plt.xlabel('Time (s)')
+    plt.ylabel(r'$\omega$ (rad/s)')
+    plt.title('Temporal Plot of Body Angular Velocity')
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No data collected, so no plot is shown.")
