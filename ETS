@@ -1,1 +1,701 @@
 
+import math
+import time
+import random
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+
+
+PLAYER_NAME = "/Robot_Pemain"
+LAWAN_01_NAME = "/Robot_Lawan_01"
+LAWAN_02_NAME = "/Robot_Lawan_02"
+
+BALL_NAME = "/Bola_Merah"
+FIELD_NAME = "/Lapangan"
+YELLOW_GOAL_NAME = "/Gawang_Kuning"
+WHITE_GOAL_NAME = "/Gawang_Putih"
+
+
+WHEEL_RADIUS = 0.0975
+BODY_RADIUS = 0.1905
+
+PLAYER_SPEED = 0.45
+PARTICIPATOR_SPEED = 0.5
+KEEPER_SPEED = 0.5
+
+BASE_V = 1.2
+BASE_W = 2.8
+
+BALL_OUT_MARGIN = 0.25
+RIGHT_OUT_TIGHTEN = 0.30
+CONTROL_DT = 0.05
+
+GOAL_CHECK_X = 0.55
+GOAL_CHECK_Y = 0.90
+GOAL_TARGET_RIGHT_SHIFT = 0.12
+
+KEEPER_FACE_ERROR = 0.08
+KEEPER_START_DISTANCE = 0.15
+KEEPER_X_OFFSET = 0.00
+KEEPER_PATROL_RANGE_Y = 0.35
+KEEPER_PATROL_TOL = 0.06
+
+BEHIND_BALL_DISTANCE = 0.82
+DRIBBLE_FORWARD_DISTANCE = 1.25
+
+ALIGN_LATERAL_TOLERANCE = 0.12
+ALIGN_BACK_MIN = 0.55
+ALIGN_BACK_MAX = 1.20
+FACE_GOAL_TOLERANCE = 0.10
+
+SAFE_BALL_CLEARANCE = 0.75
+SIDE_APPROACH_OFFSET = 0.75
+
+LAWAN_01_REACH_TOL = 0.20
+LAWAN_01_Y_MARGIN = 0.80
+
+
+def dist2d(a, b):
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+
+def angle_wrap(a):
+    while a > math.pi:
+        a -= 2 * math.pi
+    while a < -math.pi:
+        a += 2 * math.pi
+    return a
+
+
+def get_xyz(sim, obj):
+    p = sim.getObjectPosition(obj, sim.handle_world)
+    return [p[0], p[1], p[2]]
+
+
+def get_yaw(sim, obj):
+    e = sim.getObjectOrientation(obj, sim.handle_world)
+    return e[2]
+
+
+def stop_robot(sim, left_motor, right_motor):
+    sim.setJointTargetVelocity(left_motor, 0)
+    sim.setJointTargetVelocity(right_motor, 0)
+
+
+def set_diff_drive(sim, left_motor, right_motor, v, w):
+    wl = (v - w * BODY_RADIUS) / WHEEL_RADIUS
+    wr = (v + w * BODY_RADIUS) / WHEEL_RADIUS
+
+    sim.setJointTargetVelocity(left_motor, wl)
+    sim.setJointTargetVelocity(right_motor, wr)
+
+
+def drive_to_point(sim, robot, left_motor, right_motor, target_xy, speed_scale):
+    pos = get_xyz(sim, robot)
+    yaw = get_yaw(sim, robot)
+
+    dx = target_xy[0] - pos[0]
+    dy = target_xy[1] - pos[1]
+
+    target_angle = math.atan2(dy, dx)
+    err_angle = angle_wrap(target_angle - yaw)
+    distance = math.sqrt(dx * dx + dy * dy)
+
+    v = BASE_V * speed_scale
+    w = BASE_W * speed_scale * err_angle
+
+    if abs(err_angle) > 0.85:
+        v = 0.20 * BASE_V * speed_scale
+
+    if distance < 0.10:
+        v = 0
+        w = 0
+
+    set_diff_drive(sim, left_motor, right_motor, v, w)
+
+
+def face_point(sim, robot, left_motor, right_motor, target_xy, speed_scale):
+    pos = get_xyz(sim, robot)
+    yaw = get_yaw(sim, robot)
+
+    dx = target_xy[0] - pos[0]
+    dy = target_xy[1] - pos[1]
+
+    target_angle = math.atan2(dy, dx)
+    err_angle = angle_wrap(target_angle - yaw)
+
+    v = 0
+    w = BASE_W * speed_scale * err_angle
+
+    if abs(err_angle) < 0.04:
+        w = 0
+
+    set_diff_drive(sim, left_motor, right_motor, v, w)
+
+    return err_angle
+
+
+def drive_forward_to_point(sim, robot, left_motor, right_motor, target_xy, speed_scale):
+    pos = get_xyz(sim, robot)
+    yaw = get_yaw(sim, robot)
+
+    dx = target_xy[0] - pos[0]
+    dy = target_xy[1] - pos[1]
+
+    target_angle = math.atan2(dy, dx)
+    err_angle = angle_wrap(target_angle - yaw)
+
+    v = BASE_V * speed_scale
+    w = BASE_W * speed_scale * err_angle
+
+    if abs(err_angle) > 0.30:
+        v = 0.30 * BASE_V * speed_scale
+
+    set_diff_drive(sim, left_motor, right_motor, v, w)
+
+
+def get_robot_motors(sim, robot_path):
+    left_candidates = [
+        robot_path + "/leftMotor",
+        robot_path + "/left_motor",
+        robot_path + "/PioneerP3DX_leftMotor",
+        robot_path + "/leftWheel"
+    ]
+
+    right_candidates = [
+        robot_path + "/rightMotor",
+        robot_path + "/right_motor",
+        robot_path + "/PioneerP3DX_rightMotor",
+        robot_path + "/rightWheel"
+    ]
+
+    left_motor = None
+    right_motor = None
+
+    for name in left_candidates:
+        try:
+            left_motor = sim.getObject(name)
+            break
+        except Exception:
+            pass
+
+    for name in right_candidates:
+        try:
+            right_motor = sim.getObject(name)
+            break
+        except Exception:
+            pass
+
+    if left_motor is None or right_motor is None:
+        raise Exception(f"Motor tidak ditemukan untuk {robot_path}. Cek nama motor di Scene Hierarchy.")
+
+    return left_motor, right_motor
+
+
+def reset_game(sim, objects, initial_positions, initial_orientations):
+    for name, obj in objects.items():
+        sim.setObjectPosition(obj, sim.handle_world, initial_positions[name])
+        sim.setObjectOrientation(obj, sim.handle_world, initial_orientations[name])
+
+        try:
+            sim.setObjectVelocity(obj, [0, 0, 0], [0, 0, 0])
+        except Exception:
+            pass
+
+
+def reset_ball(sim, ball, ball_start, ball_orientation):
+    sim.setObjectPosition(ball, sim.handle_world, ball_start)
+    sim.setObjectOrientation(ball, sim.handle_world, ball_orientation)
+
+    try:
+        sim.setObjectVelocity(ball, [0, 0, 0], [0, 0, 0])
+    except Exception:
+        pass
+
+
+def print_initial_positions(sim, objects):
+    print("\n=== POSISI MULA MULA OBJECT DI WORLD FRAME ===")
+    for name, obj in objects.items():
+        pos = sim.getObjectPosition(obj, sim.handle_world)
+        ori = sim.getObjectOrientation(obj, sim.handle_world)
+        print(f"{name:20s} pos = [{pos[0]: .3f}, {pos[1]: .3f}, {pos[2]: .3f}] | yaw = {ori[2]: .3f} rad")
+    print("=============================================\n")
+
+
+def get_goal_center_from_children(sim, goal_obj, fallback_pos):
+    try:
+        children = sim.getObjectsInTree(goal_obj, sim.handle_all, 1)
+    except Exception:
+        children = []
+
+    points = []
+
+    for child in children:
+        try:
+            p = sim.getObjectPosition(child, sim.handle_world)
+            points.append([p[0], p[1], p[2]])
+        except Exception:
+            pass
+
+    if len(points) >= 2:
+        min_x = min(p[0] for p in points)
+        max_x = max(p[0] for p in points)
+        min_y = min(p[1] for p in points)
+        max_y = max(p[1] for p in points)
+        min_z = min(p[2] for p in points)
+
+        center_x = (min_x + max_x) / 2
+        center_y = (min_y + max_y) / 2
+        center_z = min_z
+
+        return [center_x, center_y, center_z]
+
+    return fallback_pos
+
+
+def get_adjusted_goal_target(goal_center_pos):
+    return [
+        goal_center_pos[0] + GOAL_TARGET_RIGHT_SHIFT,
+        goal_center_pos[1],
+        goal_center_pos[2]
+    ]
+
+
+def get_goal_unit_vector(ball_pos, goal_target_pos):
+    dx = goal_target_pos[0] - ball_pos[0]
+    dy = goal_target_pos[1] - ball_pos[1]
+
+    length = math.sqrt(dx * dx + dy * dy) + 1e-6
+
+    return dx / length, dy / length
+
+
+def get_line_alignment(player_pos, ball_pos, goal_target_pos):
+    ux, uy = get_goal_unit_vector(ball_pos, goal_target_pos)
+
+    px = player_pos[0] - ball_pos[0]
+    py = player_pos[1] - ball_pos[1]
+
+    along_error = px * ux + py * uy
+    lateral_error = px * (-uy) + py * ux
+
+    return along_error, lateral_error
+
+
+def player_dribble_control(
+    sim,
+    player,
+    player_lm,
+    player_rm,
+    ball,
+    yellow_goal_target_pos,
+    speed_scale
+):
+    ball_pos = get_xyz(sim, ball)
+    player_pos = get_xyz(sim, player)
+
+    ux, uy = get_goal_unit_vector(ball_pos, yellow_goal_target_pos)
+
+    behind_ball_point = [
+        ball_pos[0] - ux * BEHIND_BALL_DISTANCE,
+        ball_pos[1] - uy * BEHIND_BALL_DISTANCE
+    ]
+
+    side_left_point = [
+        ball_pos[0] - ux * BEHIND_BALL_DISTANCE + (-uy) * SIDE_APPROACH_OFFSET,
+        ball_pos[1] - uy * BEHIND_BALL_DISTANCE + ux * SIDE_APPROACH_OFFSET
+    ]
+
+    side_right_point = [
+        ball_pos[0] - ux * BEHIND_BALL_DISTANCE - (-uy) * SIDE_APPROACH_OFFSET,
+        ball_pos[1] - uy * BEHIND_BALL_DISTANCE - ux * SIDE_APPROACH_OFFSET
+    ]
+
+    push_target = [
+        ball_pos[0] + ux * DRIBBLE_FORWARD_DISTANCE,
+        ball_pos[1] + uy * DRIBBLE_FORWARD_DISTANCE
+    ]
+
+    along_error, lateral_error = get_line_alignment(
+        player_pos,
+        ball_pos,
+        yellow_goal_target_pos
+    )
+
+    distance_to_ball = dist2d(player_pos, ball_pos)
+
+    player_is_on_goal_line = abs(lateral_error) < ALIGN_LATERAL_TOLERANCE
+    player_is_behind_ball = along_error < -ALIGN_BACK_MIN
+    player_not_too_far = abs(along_error) < ALIGN_BACK_MAX
+
+    if distance_to_ball < SAFE_BALL_CLEARANCE and not player_is_behind_ball:
+        if lateral_error >= 0:
+            drive_to_point(
+                sim,
+                player,
+                player_lm,
+                player_rm,
+                side_left_point,
+                speed_scale
+            )
+        else:
+            drive_to_point(
+                sim,
+                player,
+                player_lm,
+                player_rm,
+                side_right_point,
+                speed_scale
+            )
+        return
+
+    if not player_is_on_goal_line or not player_is_behind_ball or not player_not_too_far:
+        drive_to_point(
+            sim,
+            player,
+            player_lm,
+            player_rm,
+            behind_ball_point,
+            speed_scale
+        )
+        return
+
+    angle_error = face_point(
+        sim,
+        player,
+        player_lm,
+        player_rm,
+        yellow_goal_target_pos,
+        speed_scale
+    )
+
+    if abs(angle_error) > FACE_GOAL_TOLERANCE:
+        return
+
+    drive_forward_to_point(
+        sim,
+        player,
+        player_lm,
+        player_rm,
+        push_target,
+        speed_scale
+    )
+
+
+def keeper_control(
+    sim,
+    lawan_02,
+    lawan_02_lm,
+    lawan_02_rm,
+    yellow_goal_center_pos,
+    keeper_base_x,
+    keeper_y_min,
+    keeper_y_max,
+    keeper_state,
+    keeper_direction
+):
+    lawan_02_pos = get_xyz(sim, lawan_02)
+
+    keeper_center_target = [
+        keeper_base_x,
+        yellow_goal_center_pos[1]
+    ]
+
+    if keeper_state["mode"] == "face_goal":
+        angle_error = face_point(
+            sim,
+            lawan_02,
+            lawan_02_lm,
+            lawan_02_rm,
+            yellow_goal_center_pos,
+            KEEPER_SPEED
+        )
+
+        if abs(angle_error) < KEEPER_FACE_ERROR:
+            stop_robot(sim, lawan_02_lm, lawan_02_rm)
+            keeper_state["mode"] = "go_to_keeper_center"
+            keeper_state["start_time"] = time.time()
+
+        return keeper_direction
+
+    if keeper_state["mode"] == "go_to_keeper_center":
+        drive_to_point(
+            sim,
+            lawan_02,
+            lawan_02_lm,
+            lawan_02_rm,
+            keeper_center_target,
+            KEEPER_SPEED
+        )
+
+        if dist2d(lawan_02_pos, keeper_center_target) < KEEPER_START_DISTANCE:
+            stop_robot(sim, lawan_02_lm, lawan_02_rm)
+            keeper_state["mode"] = "patrol"
+            keeper_state["start_time"] = time.time()
+
+        return keeper_direction
+
+    if keeper_direction == 1:
+        keeper_target = [
+            keeper_base_x,
+            keeper_y_max
+        ]
+
+        if lawan_02_pos[1] > keeper_y_max - KEEPER_PATROL_TOL:
+            keeper_direction = -1
+
+    else:
+        keeper_target = [
+            keeper_base_x,
+            keeper_y_min
+        ]
+
+        if lawan_02_pos[1] < keeper_y_min + KEEPER_PATROL_TOL:
+            keeper_direction = 1
+
+    drive_to_point(
+        sim,
+        lawan_02,
+        lawan_02_lm,
+        lawan_02_rm,
+        keeper_target,
+        KEEPER_SPEED
+    )
+
+    return keeper_direction
+
+
+def update_lawan_01_patrol_target(
+    field_pos,
+    yellow_goal_target_pos,
+    field_y_min,
+    field_y_max,
+    lawan_01_state
+):
+    random_y = random.uniform(field_y_min + LAWAN_01_Y_MARGIN, field_y_max - LAWAN_01_Y_MARGIN)
+
+    if yellow_goal_target_pos[0] > field_pos[0]:
+        x_left = field_pos[0] + 0.30
+        x_right = yellow_goal_target_pos[0] - 1.20
+    else:
+        x_left = yellow_goal_target_pos[0] + 1.20
+        x_right = field_pos[0] - 0.30
+
+    if lawan_01_state["direction"] == 1:
+        target = [x_right, random_y]
+        lawan_01_state["direction"] = -1
+    else:
+        target = [x_left, random_y]
+        lawan_01_state["direction"] = 1
+
+    lawan_01_state["target"] = target
+
+
+client = RemoteAPIClient()
+sim = client.require("sim")
+
+print("Connected to CoppeliaSim")
+
+player = sim.getObject(PLAYER_NAME)
+lawan_01 = sim.getObject(LAWAN_01_NAME)
+lawan_02 = sim.getObject(LAWAN_02_NAME)
+
+ball = sim.getObject(BALL_NAME)
+field = sim.getObject(FIELD_NAME)
+yellow_goal = sim.getObject(YELLOW_GOAL_NAME)
+white_goal = sim.getObject(WHITE_GOAL_NAME)
+
+player_lm, player_rm = get_robot_motors(sim, PLAYER_NAME)
+lawan_01_lm, lawan_01_rm = get_robot_motors(sim, LAWAN_01_NAME)
+lawan_02_lm, lawan_02_rm = get_robot_motors(sim, LAWAN_02_NAME)
+
+objects = {
+    "Lapangan": field,
+    "Robot_Pemain": player,
+    "Robot_Lawan_01": lawan_01,
+    "Robot_Lawan_02": lawan_02,
+    "Bola_Merah": ball,
+    "Gawang_Kuning": yellow_goal,
+    "Gawang_Putih": white_goal
+}
+
+initial_positions = {}
+initial_orientations = {}
+
+for name, obj in objects.items():
+    initial_positions[name] = sim.getObjectPosition(obj, sim.handle_world)
+    initial_orientations[name] = sim.getObjectOrientation(obj, sim.handle_world)
+
+print_initial_positions(sim, objects)
+
+ball_start = initial_positions["Bola_Merah"]
+field_pos = initial_positions["Lapangan"]
+yellow_goal_origin_pos = initial_positions["Gawang_Kuning"]
+white_goal_pos = initial_positions["Gawang_Putih"]
+
+yellow_goal_center_pos = get_goal_center_from_children(
+    sim,
+    yellow_goal,
+    yellow_goal_origin_pos
+)
+
+yellow_goal_target_pos = get_adjusted_goal_target(yellow_goal_center_pos)
+
+print("=== TARGET GAWANG KUNING ===")
+print(f"Origin Gawang_Kuning       = [{yellow_goal_origin_pos[0]: .3f}, {yellow_goal_origin_pos[1]: .3f}, {yellow_goal_origin_pos[2]: .3f}]")
+print(f"Tengah kaki Gawang_Kuning  = [{yellow_goal_center_pos[0]: .3f}, {yellow_goal_center_pos[1]: .3f}, {yellow_goal_center_pos[2]: .3f}]")
+print(f"Target bola digeser kanan  = [{yellow_goal_target_pos[0]: .3f}, {yellow_goal_target_pos[1]: .3f}, {yellow_goal_target_pos[2]: .3f}]")
+print("===================================\n")
+
+field_x_min = min(yellow_goal_target_pos[0], white_goal_pos[0]) - 1.0
+field_x_max = max(yellow_goal_target_pos[0], white_goal_pos[0]) + 1.0
+field_y_min = field_pos[1] - 3.2
+field_y_max = field_pos[1] + 3.2
+
+right_ball_out_limit = field_x_max - RIGHT_OUT_TIGHTEN
+
+keeper_base_x = yellow_goal_center_pos[0]
+keeper_y_min = yellow_goal_center_pos[1] - KEEPER_PATROL_RANGE_Y
+keeper_y_max = yellow_goal_center_pos[1] + KEEPER_PATROL_RANGE_Y
+keeper_direction = 1
+
+keeper_state = {
+    "mode": "face_goal",
+    "start_time": time.time()
+}
+
+lawan_01_state = {
+    "direction": 1,
+    "target": [field_pos[0], field_pos[1]]
+}
+
+update_lawan_01_patrol_target(
+    field_pos,
+    yellow_goal_target_pos,
+    field_y_min,
+    field_y_max,
+    lawan_01_state
+)
+
+if sim.getSimulationState() == sim.simulation_stopped:
+    sim.startSimulation()
+    time.sleep(1)
+
+try:
+    while True:
+        ball_pos = get_xyz(sim, ball)
+        lawan_01_pos = get_xyz(sim, lawan_01)
+
+        yellow_goal_center_pos = get_goal_center_from_children(
+            sim,
+            yellow_goal,
+            yellow_goal_origin_pos
+        )
+
+        yellow_goal_target_pos = get_adjusted_goal_target(yellow_goal_center_pos)
+
+        keeper_base_x = yellow_goal_center_pos[0]
+        keeper_y_min = yellow_goal_center_pos[1] - KEEPER_PATROL_RANGE_Y
+        keeper_y_max = yellow_goal_center_pos[1] + KEEPER_PATROL_RANGE_Y
+
+        goal_check_x = abs(ball_pos[0] - yellow_goal_target_pos[0])
+        goal_check_y = abs(ball_pos[1] - yellow_goal_target_pos[1])
+
+        if goal_check_x < GOAL_CHECK_X and goal_check_y < GOAL_CHECK_Y:
+            print("Bola merah masuk gawang kuning!")
+
+            stop_robot(sim, player_lm, player_rm)
+            stop_robot(sim, lawan_01_lm, lawan_01_rm)
+            stop_robot(sim, lawan_02_lm, lawan_02_rm)
+
+            time.sleep(5)
+
+            reset_game(sim, objects, initial_positions, initial_orientations)
+
+            yellow_goal_center_pos = get_goal_center_from_children(
+                sim,
+                yellow_goal,
+                yellow_goal_origin_pos
+            )
+
+            yellow_goal_target_pos = get_adjusted_goal_target(yellow_goal_center_pos)
+
+            keeper_base_x = yellow_goal_center_pos[0]
+            keeper_y_min = yellow_goal_center_pos[1] - KEEPER_PATROL_RANGE_Y
+            keeper_y_max = yellow_goal_center_pos[1] + KEEPER_PATROL_RANGE_Y
+
+            keeper_direction = 1
+            keeper_state["mode"] = "face_goal"
+            keeper_state["start_time"] = time.time()
+
+            lawan_01_state["direction"] = 1
+
+            update_lawan_01_patrol_target(
+                field_pos,
+                yellow_goal_target_pos,
+                field_y_min,
+                field_y_max,
+                lawan_01_state
+            )
+
+            continue
+
+        if (
+            ball_pos[0] < field_x_min - BALL_OUT_MARGIN or
+            ball_pos[0] > right_ball_out_limit + BALL_OUT_MARGIN or
+            ball_pos[1] < field_y_min - BALL_OUT_MARGIN or
+            ball_pos[1] > field_y_max + BALL_OUT_MARGIN
+        ):
+            print("Bola keluar lapangan. Reset bola ke posisi awal.")
+            reset_ball(sim, ball, ball_start, initial_orientations["Bola_Merah"])
+
+        keeper_direction = keeper_control(
+            sim,
+            lawan_02,
+            lawan_02_lm,
+            lawan_02_rm,
+            yellow_goal_center_pos,
+            keeper_base_x,
+            keeper_y_min,
+            keeper_y_max,
+            keeper_state,
+            keeper_direction
+        )
+
+        player_dribble_control(
+            sim,
+            player,
+            player_lm,
+            player_rm,
+            ball,
+            yellow_goal_target_pos,
+            PLAYER_SPEED
+        )
+
+        if dist2d(lawan_01_pos, lawan_01_state["target"]) < LAWAN_01_REACH_TOL:
+            update_lawan_01_patrol_target(
+                field_pos,
+                yellow_goal_target_pos,
+                field_y_min,
+                field_y_max,
+                lawan_01_state
+            )
+
+        drive_to_point(
+            sim,
+            lawan_01,
+            lawan_01_lm,
+            lawan_01_rm,
+            lawan_01_state["target"],
+            PARTICIPATOR_SPEED
+        )
+
+        time.sleep(CONTROL_DT)
+
+except KeyboardInterrupt:
+    print("Program dihentikan.")
+
+finally:
+    stop_robot(sim, player_lm, player_rm)
+    stop_robot(sim, lawan_01_lm, lawan_01_rm)
+    stop_robot(sim, lawan_02_lm, lawan_02_rm)
+    print("Semua robot dihentikan.")
