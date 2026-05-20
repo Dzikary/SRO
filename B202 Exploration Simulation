@@ -1,0 +1,355 @@
+# %%
+import time
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+
+client = RemoteAPIClient()
+sim = client.require("sim")
+
+sim.startSimulation()
+print("Simulation Started")
+
+
+def transformMat(alpha, beta, gamma, tx, ty, tz):
+    rotx = np.array([
+        [1, 0, 0],
+        [0, math.cos(alpha), -math.sin(alpha)],
+        [0, math.sin(alpha),  math.cos(alpha)]
+    ])
+
+    roty = np.array([
+        [math.cos(beta), 0, math.sin(beta)],
+        [0, 1, 0],
+        [-math.sin(beta), 0, math.cos(beta)]
+    ])
+
+    rotz = np.array([
+        [math.cos(gamma), -math.sin(gamma), 0],
+        [math.sin(gamma),  math.cos(gamma), 0],
+        [0, 0, 1]
+    ])
+
+    rot_total = rotx @ roty @ rotz
+
+    trans_vector = np.array([
+        [tx],
+        [ty],
+        [tz]
+    ])
+
+    R_t_3x4 = np.hstack((rot_total, trans_vector))
+    homogeneous_row = np.array([[0, 0, 0, 1]])
+
+    return np.vstack((R_t_3x4, homogeneous_row))
+
+
+def get_object_safe(name):
+    try:
+        return sim.getObject(name)
+    except Exception:
+        return None
+
+
+def angle_wrap(angle):
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
+
+
+p3dx = sim.getObject("/PioneerP3DX")
+p3dx_rw = sim.getObject("/PioneerP3DX/rightMotor")
+p3dx_lw = sim.getObject("/PioneerP3DX/leftMotor")
+
+LH_Handle = sim.getObject("/LH")
+perp_Handle = sim.getObject("/Perp")
+
+path_Handle = []
+
+for i in range(28):
+    handle = get_object_safe(f"/D1[{i}]")
+    if handle is not None:
+        path_Handle.append(handle)
+
+if len(path_Handle) == 0:
+    for i in range(12):
+        handle = get_object_safe(f"/p[{i}]")
+        if handle is not None:
+            path_Handle.append(handle)
+
+if len(path_Handle) < 2:
+    raise Exception("Path object is not enough. Need at least 2 D1 or p points.")
+
+sensor_handles = []
+
+for i in range(16):
+    handle = get_object_safe(f"/PioneerP3DX/ultrasonicSensor[{i}]")
+    if handle is not None:
+        sensor_handles.append(handle)
+
+rw = 0.195 / 2
+rb = 0.318 / 2
+
+LH_distance = 1.5
+
+kp_v = 0.3
+kp_w = 0.9
+
+max_vx = 0.6
+max_wx = 1.8
+
+taken_distance_threshold = 0.35
+
+taken_segment = [False for _ in range(len(path_Handle))]
+
+robot_x_history = []
+robot_y_history = []
+
+map_x = []
+map_y = []
+
+plt.ion()
+fig, ax = plt.subplots(figsize=(7, 7))
+fig.canvas.manager.set_window_title("P3DX World Space Mapping")
+
+last_plot_update = 0.0
+plot_update_interval = 0.15
+
+try:
+    start_time = time.time()
+    elapsed_prev = 0.0
+
+    while time.time() - start_time < 90:
+        elapsed = time.time() - start_time
+        dt = elapsed - elapsed_prev
+        elapsed_prev = elapsed
+
+        p3dx_position = sim.getObjectPosition(p3dx, sim.handle_world)
+        p3dx_orientation = sim.getObjectOrientation(p3dx, sim.handle_world)
+
+        robot_x = p3dx_position[0]
+        robot_y = p3dx_position[1]
+        robot_yaw = p3dx_orientation[2]
+
+        robot_x_history.append(robot_x)
+        robot_y_history.append(robot_y)
+
+        LH_position_to_world = transformMat(
+            0,
+            0,
+            robot_yaw,
+            p3dx_position[0],
+            p3dx_position[1],
+            p3dx_position[2]
+        ) @ np.array([[LH_distance], [0], [0], [1]])
+
+        LH_position_to_world = LH_position_to_world[:3, :]
+
+        path_points = []
+
+        for handle in path_Handle:
+            pos = sim.getObjectPosition(handle, sim.handle_world)
+            path_points.append(np.array([[pos[0]], [pos[1]], [pos[2]]]))
+
+        vec_AB = []
+
+        for i in range(len(path_points)):
+            A = path_points[i]
+            B = path_points[(i + 1) % len(path_points)]
+            vec_AB.append(B - A)
+
+        scalar_proj_points = []
+
+        for i in range(len(path_points)):
+            A = path_points[i]
+            AB = vec_AB[i]
+            ALH = LH_position_to_world - A
+
+            AB_dot_AB = float(AB.T @ AB)
+
+            if AB_dot_AB == 0:
+                scalar_proj = 0
+            else:
+                scalar_proj = float((ALH.T @ AB) / AB_dot_AB)
+
+            if scalar_proj < 0:
+                scalar_proj = 0
+            elif scalar_proj > 1:
+                scalar_proj = 1
+
+            scalar_proj_point = A + scalar_proj * AB
+            scalar_proj_points.append(scalar_proj_point)
+
+        robot_pos_np = np.array([
+            [p3dx_position[0]],
+            [p3dx_position[1]],
+            [p3dx_position[2]]
+        ])
+
+        for i in range(len(scalar_proj_points)):
+            dist_robot_to_proj = np.linalg.norm(scalar_proj_points[i] - robot_pos_np)
+
+            if dist_robot_to_proj < taken_distance_threshold:
+                taken_segment[i] = True
+
+        all_taken = all(taken_segment)
+
+        candidate_indices = []
+
+        for i in range(len(scalar_proj_points)):
+            if not taken_segment[i] or all_taken:
+                candidate_indices.append(i)
+
+        closest_index = candidate_indices[0]
+        min_distance = np.linalg.norm(scalar_proj_points[closest_index] - LH_position_to_world)
+
+        for i in candidate_indices[1:]:
+            distance = np.linalg.norm(scalar_proj_points[i] - LH_position_to_world)
+
+            if distance < min_distance:
+                min_distance = distance
+                closest_index = i
+
+        desired_position = scalar_proj_points[closest_index]
+
+        T_world_robot = transformMat(
+            0,
+            0,
+            robot_yaw,
+            p3dx_position[0],
+            p3dx_position[1],
+            p3dx_position[2]
+        )
+
+        desired_position_wrt_robot = np.linalg.inv(T_world_robot) @ np.append(
+            desired_position,
+            np.array([[1]]),
+            axis=0
+        )
+
+        desired_position_wrt_robot = desired_position_wrt_robot[:3, :]
+
+        ed = math.sqrt(
+            float(desired_position_wrt_robot[0]) ** 2 +
+            float(desired_position_wrt_robot[1]) ** 2
+        )
+
+        eh = math.atan2(
+            float(desired_position_wrt_robot[1]),
+            float(desired_position_wrt_robot[0])
+        )
+
+        vx = kp_v * ed
+        wx = kp_w * eh
+
+        vx = max(-max_vx, min(max_vx, vx))
+        wx = max(-max_wx, min(max_wx, wx))
+
+        wr_vel = (vx + (rb * wx) / 2) / rw
+        wl_vel = (vx - (rb * wx) / 2) / rw
+
+        sim.setJointTargetVelocity(p3dx_rw, wr_vel)
+        sim.setJointTargetVelocity(p3dx_lw, wl_vel)
+
+        sim.setObjectPosition(
+            LH_Handle,
+            sim.handle_world,
+            LH_position_to_world.flatten().tolist()
+        )
+
+        sim.setObjectPosition(
+            perp_Handle,
+            sim.handle_world,
+            desired_position.flatten().tolist()
+        )
+
+        for sensor in sensor_handles:
+            result = sim.readProximitySensor(sensor)
+
+            detected = result[0]
+
+            if detected:
+                detected_point_sensor = result[2]
+
+                sensor_position = sim.getObjectPosition(sensor, sim.handle_world)
+                sensor_orientation = sim.getObjectOrientation(sensor, sim.handle_world)
+
+                T_world_sensor = transformMat(
+                    sensor_orientation[0],
+                    sensor_orientation[1],
+                    sensor_orientation[2],
+                    sensor_position[0],
+                    sensor_position[1],
+                    sensor_position[2]
+                )
+
+                point_sensor = np.array([
+                    [detected_point_sensor[0]],
+                    [detected_point_sensor[1]],
+                    [detected_point_sensor[2]],
+                    [1]
+                ])
+
+                point_world = T_world_sensor @ point_sensor
+
+                map_x.append(float(point_world[0]))
+                map_y.append(float(point_world[1]))
+
+        if elapsed - last_plot_update >= plot_update_interval:
+            last_plot_update = elapsed
+
+            ax.clear()
+
+            if len(map_x) > 0:
+                ax.scatter(map_x, map_y, s=8, label="World space point cloud")
+
+            ax.plot(robot_x_history, robot_y_history, linewidth=1.5, label="Robot trajectory")
+
+            ax.scatter(robot_x, robot_y, s=70, marker="o", label="P3DX")
+            ax.scatter(float(LH_position_to_world[0]), float(LH_position_to_world[1]), s=60, marker="x", label="LH")
+            ax.scatter(float(desired_position[0]), float(desired_position[1]), s=70, marker="s", label="Perp target")
+
+            ax.plot(
+                [robot_x, float(desired_position[0])],
+                [robot_y, float(desired_position[1])],
+                linewidth=1,
+                label="Scan line"
+            )
+
+            free_x = []
+            free_y = []
+            taken_x = []
+            taken_y = []
+
+            for i, point in enumerate(path_points):
+                if taken_segment[i]:
+                    taken_x.append(float(point[0]))
+                    taken_y.append(float(point[1]))
+                else:
+                    free_x.append(float(point[0]))
+                    free_y.append(float(point[1]))
+
+            if len(free_x) > 0:
+                ax.scatter(free_x, free_y, s=25, marker="o", label="Untaken D1")
+
+            if len(taken_x) > 0:
+                ax.scatter(taken_x, taken_y, s=25, marker="x", label="Taken D1")
+
+            ax.set_title("World Space Mapping")
+            ax.set_xlabel("x world frame")
+            ax.set_ylabel("y world frame")
+            ax.grid(True)
+            ax.axis("equal")
+            ax.legend(loc="best")
+            plt.pause(0.001)
+
+finally:
+    sim.setJointTargetVelocity(p3dx_rw, 0)
+    sim.setJointTargetVelocity(p3dx_lw, 0)
+    sim.stopSimulation()
+    plt.ioff()
+    plt.show()
+    print("\nSimulation Stopped")
