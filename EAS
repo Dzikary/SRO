@@ -1,0 +1,1864 @@
+import copy
+import json
+import math
+import queue
+import random
+import threading
+import time
+from typing import Any
+
+from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from ollama import ResponseError, chat, generate
+
+
+# ============================================================
+# 1. OBJECT NAMES IN COPPELIASIM
+# ============================================================
+
+PLAYER_NAME = "/Robot_Pemain"
+LAWAN_01_NAME = "/Robot_Lawan_01"
+LAWAN_02_NAME = "/Robot_Lawan_02"
+
+BALL_NAME = "/Bola_Merah"
+FIELD_NAME = "/Lapangan"
+YELLOW_GOAL_NAME = "/Gawang_Kuning"
+WHITE_GOAL_NAME = "/Gawang_Putih"
+
+
+# ============================================================
+# 2. ROBOT AND CONTROL PARAMETERS
+# ============================================================
+
+WHEEL_RADIUS = 0.0975
+BODY_RADIUS = 0.1905  # half of left-right wheel separation
+
+PLAYER_SPEED = 0.45
+PARTICIPATOR_SPEED = 0.50
+KEEPER_SPEED = 0.50
+
+BASE_V = 1.20
+BASE_W = 2.80
+
+CONTROL_DT = 0.05  # 20 Hz low-level feedback loop
+
+
+# ============================================================
+# 3. FIELD, GOAL, AND GAME PARAMETERS
+# ============================================================
+
+BALL_OUT_MARGIN = 0.25
+RIGHT_OUT_TIGHTEN = 0.30
+
+GOAL_CHECK_X = 0.55
+GOAL_CHECK_Y = 0.90
+GOAL_TARGET_RIGHT_SHIFT = 0.12
+
+KEEPER_FACE_ERROR = 0.08
+KEEPER_START_DISTANCE = 0.15
+KEEPER_PATROL_RANGE_Y = 0.35
+KEEPER_PATROL_TOL = 0.06
+
+LAWAN_01_REACH_TOL = 0.20
+LAWAN_01_Y_MARGIN = 0.80
+
+
+# ============================================================
+# 4. PLAYER GEOMETRIC BEHAVIOR PARAMETERS
+# ============================================================
+
+BEHIND_BALL_DISTANCE = 0.82
+DRIBBLE_FORWARD_DISTANCE = 1.25
+SIDE_APPROACH_OFFSET = 0.75
+
+ALIGN_LATERAL_TOLERANCE = 0.12
+ALIGN_BACK_MIN = 0.55
+ALIGN_BACK_MAX = 1.20
+FACE_GOAL_TOLERANCE = 0.10
+SAFE_BALL_CLEARANCE = 0.75
+
+
+# ============================================================
+# 5. PROXIMITY SENSOR PARAMETERS
+# ============================================================
+
+# False: code may run even when no proximity sensor is installed.
+# True : code stops at startup when sensors are not detected.
+# For final submission, set this to True after adding the sensors.
+REQUIRE_PROXIMITY_SENSOR = False
+
+SENSOR_MAX_RANGE = 2.50
+SENSOR_EMERGENCY_STOP = 0.10
+SENSOR_AVOID_DISTANCE = 0.30
+
+
+# ============================================================
+# 6. LOCAL LLM PARAMETERS
+# ============================================================
+
+MODEL_NAME = "gemma3:1b"
+# LLM is a high-level planner, not the 20 Hz motor controller.
+# 0.50 s gives quicker behavior updates without flooding Ollama.
+LLM_REQUEST_INTERVAL = 0.50
+LLM_KEEP_ALIVE = "30m"
+LLM_NUM_CTX = 1024
+LLM_NUM_PREDICT = 16
+
+ALLOWED_PRESET_COMMANDS = {
+    "APPROACH_SIDE_LEFT",
+    "APPROACH_SIDE_RIGHT",
+    "GO_BEHIND_BALL",
+    "ALIGN_TO_GOAL",
+    "DRIBBLE_FORWARD",
+    "AVOID_LEFT",
+    "AVOID_RIGHT",
+    "STOP",
+}
+
+ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": sorted(ALLOWED_PRESET_COMMANDS),
+        },
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
+
+
+# ============================================================
+# 7. GENERAL UTILITIES
+# ============================================================
+
+
+def dist2d(a: list[float], b: list[float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def angle_wrap(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(value, maximum))
+
+
+def get_xyz(sim: Any, obj: int) -> list[float]:
+    position = sim.getObjectPosition(obj, sim.handle_world)
+    return [float(position[0]), float(position[1]), float(position[2])]
+
+
+def get_yaw(sim: Any, obj: int) -> float:
+    orientation = sim.getObjectOrientation(obj, sim.handle_world)
+    return float(orientation[2])
+
+
+def get_actual_velocity(sim: Any, obj: int) -> tuple[list[float], list[float]]:
+    linear_velocity, angular_velocity = sim.getObjectVelocity(obj)
+
+    linear = [
+        float(linear_velocity[0]),
+        float(linear_velocity[1]),
+        float(linear_velocity[2]),
+    ]
+    angular = [
+        float(angular_velocity[0]),
+        float(angular_velocity[1]),
+        float(angular_velocity[2]),
+    ]
+
+    return linear, angular
+
+
+# ============================================================
+# 8. DIFFERENTIAL-DRIVE ACTION FUNCTIONS
+# ============================================================
+
+
+def stop_robot(sim: Any, left_motor: int, right_motor: int) -> None:
+    sim.setJointTargetVelocity(left_motor, 0.0)
+    sim.setJointTargetVelocity(right_motor, 0.0)
+
+
+def set_joint_velocity(
+    sim: Any,
+    left_motor: int,
+    right_motor: int,
+    left_wheel_velocity: float,
+    right_wheel_velocity: float,
+) -> None:
+    """Joint-space action: direct left and right wheel angular velocity."""
+
+    sim.setJointTargetVelocity(left_motor, float(left_wheel_velocity))
+    sim.setJointTargetVelocity(right_motor, float(right_wheel_velocity))
+
+
+def body_to_joint_velocity(
+    linear_velocity: float,
+    angular_velocity: float,
+) -> tuple[float, float]:
+    """Convert body-space Twist (v, w) to wheel joint velocity."""
+
+    left_wheel_velocity = (
+        linear_velocity - angular_velocity * BODY_RADIUS
+    ) / WHEEL_RADIUS
+
+    right_wheel_velocity = (
+        linear_velocity + angular_velocity * BODY_RADIUS
+    ) / WHEEL_RADIUS
+
+    return left_wheel_velocity, right_wheel_velocity
+
+
+def set_diff_drive(
+    sim: Any,
+    left_motor: int,
+    right_motor: int,
+    linear_velocity: float,
+    angular_velocity: float,
+) -> None:
+    """Body-space action followed by body-to-joint conversion."""
+
+    left_wheel_velocity, right_wheel_velocity = body_to_joint_velocity(
+        linear_velocity,
+        angular_velocity,
+    )
+
+    set_joint_velocity(
+        sim,
+        left_motor,
+        right_motor,
+        left_wheel_velocity,
+        right_wheel_velocity,
+    )
+
+
+# ============================================================
+# 9. LOW-LEVEL CLOSED-LOOP MOTION CONTROLLERS
+# ============================================================
+
+
+def drive_to_point(
+    sim: Any,
+    robot: int,
+    left_motor: int,
+    right_motor: int,
+    target_xy: list[float],
+    speed_scale: float,
+) -> None:
+    position = get_xyz(sim, robot)
+    yaw = get_yaw(sim, robot)
+
+    dx = target_xy[0] - position[0]
+    dy = target_xy[1] - position[1]
+
+    target_angle = math.atan2(dy, dx)
+    heading_error = angle_wrap(target_angle - yaw)
+    distance = math.hypot(dx, dy)
+
+    linear_velocity = BASE_V * speed_scale
+    angular_velocity = BASE_W * speed_scale * heading_error
+
+    angular_velocity = clamp(angular_velocity, -2.5, 2.5)
+
+    if abs(heading_error) > 0.85:
+        linear_velocity = 0.20 * BASE_V * speed_scale
+
+    if distance < 0.10:
+        linear_velocity = 0.0
+        angular_velocity = 0.0
+
+    set_diff_drive(
+        sim,
+        left_motor,
+        right_motor,
+        linear_velocity,
+        angular_velocity,
+    )
+
+
+def face_point(
+    sim: Any,
+    robot: int,
+    left_motor: int,
+    right_motor: int,
+    target_xy: list[float],
+    speed_scale: float,
+) -> float:
+    position = get_xyz(sim, robot)
+    yaw = get_yaw(sim, robot)
+
+    dx = target_xy[0] - position[0]
+    dy = target_xy[1] - position[1]
+
+    target_angle = math.atan2(dy, dx)
+    heading_error = angle_wrap(target_angle - yaw)
+
+    linear_velocity = 0.0
+    angular_velocity = BASE_W * speed_scale * heading_error
+    angular_velocity = clamp(angular_velocity, -2.5, 2.5)
+
+    if abs(heading_error) < 0.04:
+        angular_velocity = 0.0
+
+    set_diff_drive(
+        sim,
+        left_motor,
+        right_motor,
+        linear_velocity,
+        angular_velocity,
+    )
+
+    return heading_error
+
+
+def drive_forward_to_point(
+    sim: Any,
+    robot: int,
+    left_motor: int,
+    right_motor: int,
+    target_xy: list[float],
+    speed_scale: float,
+) -> None:
+    position = get_xyz(sim, robot)
+    yaw = get_yaw(sim, robot)
+
+    dx = target_xy[0] - position[0]
+    dy = target_xy[1] - position[1]
+
+    target_angle = math.atan2(dy, dx)
+    heading_error = angle_wrap(target_angle - yaw)
+
+    linear_velocity = BASE_V * speed_scale
+    angular_velocity = BASE_W * speed_scale * heading_error
+    angular_velocity = clamp(angular_velocity, -2.5, 2.5)
+
+    if abs(heading_error) > 0.30:
+        linear_velocity = 0.30 * BASE_V * speed_scale
+
+    set_diff_drive(
+        sim,
+        left_motor,
+        right_motor,
+        linear_velocity,
+        angular_velocity,
+    )
+
+
+# ============================================================
+# 10. OBJECT AND MOTOR DISCOVERY
+# ============================================================
+
+
+def get_robot_motors(sim: Any, robot_path: str) -> tuple[int, int]:
+    left_candidates = [
+        robot_path + "/leftMotor",
+        robot_path + "/left_motor",
+        robot_path + "/PioneerP3DX_leftMotor",
+        robot_path + "/leftWheel",
+    ]
+
+    right_candidates = [
+        robot_path + "/rightMotor",
+        robot_path + "/right_motor",
+        robot_path + "/PioneerP3DX_rightMotor",
+        robot_path + "/rightWheel",
+    ]
+
+    left_motor = None
+    right_motor = None
+
+    for name in left_candidates:
+        try:
+            left_motor = sim.getObject(name)
+            break
+        except Exception:
+            pass
+
+    for name in right_candidates:
+        try:
+            right_motor = sim.getObject(name)
+            break
+        except Exception:
+            pass
+
+    if left_motor is None or right_motor is None:
+        raise RuntimeError(
+            f"Motor tidak ditemukan untuk {robot_path}. "
+            "Periksa nama motor pada Scene Hierarchy."
+        )
+
+    return left_motor, right_motor
+
+
+def get_object_alias_safe(sim: Any, object_handle: int) -> str:
+    try:
+        return str(sim.getObjectAlias(object_handle, 1))
+    except Exception:
+        return str(object_handle)
+
+
+# ============================================================
+# 11. PROXIMITY SENSOR DISCOVERY AND READING
+# ============================================================
+
+
+def discover_player_proximity_sensors(
+    sim: Any,
+    player: int,
+) -> list[dict[str, Any]]:
+    try:
+        sensor_handles = sim.getObjectsInTree(
+            player,
+            sim.object_proximitysensor_type,
+            1,
+        )
+    except Exception as error:
+        print(f"[SENSOR] Gagal mencari proximity sensor: {error}")
+        sensor_handles = []
+
+    sensors: list[dict[str, Any]] = []
+
+    for sensor_handle in sensor_handles:
+        alias = get_object_alias_safe(sim, sensor_handle)
+
+        try:
+            # Matrix of the sensor frame relative to the robot frame.
+            # CoppeliaSim proximity sensors detect along their local +Z axis.
+            matrix = sim.getObjectMatrix(sensor_handle, player)
+
+            sensor_z_axis_x = float(matrix[2])
+            sensor_z_axis_y = float(matrix[6])
+            heading_rad = math.atan2(sensor_z_axis_y, sensor_z_axis_x)
+        except Exception:
+            heading_rad = 0.0
+
+        heading_deg = math.degrees(angle_wrap(heading_rad))
+
+        if -35.0 <= heading_deg <= 35.0:
+            sector = "front"
+        elif 35.0 < heading_deg <= 80.0:
+            sector = "front_left"
+        elif 80.0 < heading_deg <= 125.0:
+            sector = "left"
+        elif -80.0 <= heading_deg < -35.0:
+            sector = "front_right"
+        elif -125.0 <= heading_deg < -80.0:
+            sector = "right"
+        else:
+            sector = "other"
+
+        sensors.append(
+            {
+                "handle": sensor_handle,
+                "alias": alias,
+                "heading_deg": heading_deg,
+                "sector": sector,
+            }
+        )
+
+    print("\n=== PLAYER PROXIMITY SENSOR DISCOVERY ===")
+
+    if not sensors:
+        print("Tidak ada proximity sensor ditemukan di bawah Robot_Pemain.")
+        print(
+            "Program tetap dapat berjalan karena "
+            "REQUIRE_PROXIMITY_SENSOR=False."
+        )
+    else:
+        for sensor in sensors:
+            print(
+                f"{sensor['alias']:35s} "
+                f"heading={sensor['heading_deg']:7.2f} deg "
+                f"sector={sensor['sector']}"
+            )
+
+    print("=========================================\n")
+
+    if REQUIRE_PROXIMITY_SENSOR and not sensors:
+        raise RuntimeError(
+            "Proximity sensor wajib, tetapi tidak ditemukan. "
+            "Tambahkan sensor ke Robot_Pemain atau periksa hierarchy."
+        )
+
+    return sensors
+
+
+def read_single_proximity_distance(sim: Any, sensor_handle: int) -> float:
+    try:
+        reading = sim.readProximitySensor(sensor_handle)
+    except Exception:
+        return SENSOR_MAX_RANGE
+
+    if not reading:
+        return SENSOR_MAX_RANGE
+
+    detected = bool(reading[0])
+
+    if not detected:
+        return SENSOR_MAX_RANGE
+
+    # Depending on CoppeliaSim/API version, the second value can be a
+    # scalar distance or a detected point vector. This parser supports both.
+    for value in reading[1:3]:
+        if isinstance(value, (int, float)):
+            distance = float(value)
+            if distance >= 0.0:
+                return min(distance, SENSOR_MAX_RANGE)
+
+        if isinstance(value, (list, tuple)) and len(value) >= 3:
+            distance = math.sqrt(
+                float(value[0]) ** 2
+                + float(value[1]) ** 2
+                + float(value[2]) ** 2
+            )
+            return min(distance, SENSOR_MAX_RANGE)
+
+    return SENSOR_MAX_RANGE
+
+
+def read_proximity_state(
+    sim: Any,
+    sensor_definitions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    distances = {
+        "front": SENSOR_MAX_RANGE,
+        "front_left": SENSOR_MAX_RANGE,
+        "front_right": SENSOR_MAX_RANGE,
+        "left": SENSOR_MAX_RANGE,
+        "right": SENSOR_MAX_RANGE,
+    }
+
+    for sensor in sensor_definitions:
+        sector = sensor["sector"]
+
+        if sector not in distances:
+            continue
+
+        distance = read_single_proximity_distance(
+            sim,
+            sensor["handle"],
+        )
+
+        distances[sector] = min(distances[sector], distance)
+
+    return {
+        "available": len(sensor_definitions) > 0,
+        **distances,
+    }
+
+
+# ============================================================
+# 12. GAME RESET AND GOAL GEOMETRY
+# ============================================================
+
+
+def reset_game(
+    sim: Any,
+    objects: dict[str, int],
+    initial_positions: dict[str, list[float]],
+    initial_orientations: dict[str, list[float]],
+) -> None:
+    for name, obj in objects.items():
+        sim.setObjectPosition(
+            obj,
+            sim.handle_world,
+            initial_positions[name],
+        )
+        sim.setObjectOrientation(
+            obj,
+            sim.handle_world,
+            initial_orientations[name],
+        )
+
+        try:
+            sim.setObjectVelocity(obj, [0, 0, 0], [0, 0, 0])
+        except Exception:
+            pass
+
+
+def reset_ball(
+    sim: Any,
+    ball: int,
+    ball_start: list[float],
+    ball_orientation: list[float],
+) -> None:
+    sim.setObjectPosition(ball, sim.handle_world, ball_start)
+    sim.setObjectOrientation(ball, sim.handle_world, ball_orientation)
+
+    try:
+        sim.setObjectVelocity(ball, [0, 0, 0], [0, 0, 0])
+    except Exception:
+        pass
+
+
+def print_initial_positions(
+    sim: Any,
+    objects: dict[str, int],
+) -> None:
+    print("\n=== POSISI MULA-MULA OBJECT DI WORLD FRAME ===")
+
+    for name, obj in objects.items():
+        position = sim.getObjectPosition(obj, sim.handle_world)
+        orientation = sim.getObjectOrientation(obj, sim.handle_world)
+
+        print(
+            f"{name:20s} "
+            f"pos=[{position[0]: .3f}, {position[1]: .3f}, "
+            f"{position[2]: .3f}] | yaw={orientation[2]: .3f} rad"
+        )
+
+    print("================================================\n")
+
+
+def get_goal_center_from_children(
+    sim: Any,
+    goal_obj: int,
+    fallback_position: list[float],
+) -> list[float]:
+    try:
+        children = sim.getObjectsInTree(goal_obj, sim.handle_all, 1)
+    except Exception:
+        children = []
+
+    points: list[list[float]] = []
+
+    for child in children:
+        try:
+            point = sim.getObjectPosition(child, sim.handle_world)
+            points.append(
+                [float(point[0]), float(point[1]), float(point[2])]
+            )
+        except Exception:
+            pass
+
+    if len(points) >= 2:
+        min_x = min(point[0] for point in points)
+        max_x = max(point[0] for point in points)
+        min_y = min(point[1] for point in points)
+        max_y = max(point[1] for point in points)
+        min_z = min(point[2] for point in points)
+
+        return [
+            (min_x + max_x) / 2.0,
+            (min_y + max_y) / 2.0,
+            min_z,
+        ]
+
+    return fallback_position.copy()
+
+
+def get_adjusted_goal_target(
+    goal_center_position: list[float],
+) -> list[float]:
+    return [
+        goal_center_position[0] + GOAL_TARGET_RIGHT_SHIFT,
+        goal_center_position[1],
+        goal_center_position[2],
+    ]
+
+
+# ============================================================
+# 13. PLAYER GEOMETRY AND STATE CONSTRUCTION
+# ============================================================
+
+
+def get_goal_unit_vector(
+    ball_position: list[float],
+    goal_target_position: list[float],
+) -> tuple[float, float]:
+    dx = goal_target_position[0] - ball_position[0]
+    dy = goal_target_position[1] - ball_position[1]
+
+    length = math.hypot(dx, dy) + 1e-6
+    return dx / length, dy / length
+
+
+def get_line_alignment(
+    player_position: list[float],
+    ball_position: list[float],
+    goal_target_position: list[float],
+) -> tuple[float, float]:
+    unit_x, unit_y = get_goal_unit_vector(
+        ball_position,
+        goal_target_position,
+    )
+
+    relative_x = player_position[0] - ball_position[0]
+    relative_y = player_position[1] - ball_position[1]
+
+    along_error = relative_x * unit_x + relative_y * unit_y
+    lateral_error = relative_x * (-unit_y) + relative_y * unit_x
+
+    return along_error, lateral_error
+
+
+def calculate_player_targets(
+    player_position: list[float],
+    ball_position: list[float],
+    goal_target_position: list[float],
+) -> dict[str, Any]:
+    del player_position  # target geometry only depends on ball and goal
+
+    unit_x, unit_y = get_goal_unit_vector(
+        ball_position,
+        goal_target_position,
+    )
+
+    behind_ball_point = [
+        ball_position[0] - unit_x * BEHIND_BALL_DISTANCE,
+        ball_position[1] - unit_y * BEHIND_BALL_DISTANCE,
+    ]
+
+    side_left_point = [
+        ball_position[0]
+        - unit_x * BEHIND_BALL_DISTANCE
+        + (-unit_y) * SIDE_APPROACH_OFFSET,
+        ball_position[1]
+        - unit_y * BEHIND_BALL_DISTANCE
+        + unit_x * SIDE_APPROACH_OFFSET,
+    ]
+
+    side_right_point = [
+        ball_position[0]
+        - unit_x * BEHIND_BALL_DISTANCE
+        - (-unit_y) * SIDE_APPROACH_OFFSET,
+        ball_position[1]
+        - unit_y * BEHIND_BALL_DISTANCE
+        - unit_x * SIDE_APPROACH_OFFSET,
+    ]
+
+    push_target = [
+        ball_position[0] + unit_x * DRIBBLE_FORWARD_DISTANCE,
+        ball_position[1] + unit_y * DRIBBLE_FORWARD_DISTANCE,
+    ]
+
+    return {
+        "behind_ball": behind_ball_point,
+        "side_left": side_left_point,
+        "side_right": side_right_point,
+        "push_target": push_target,
+        "goal_unit_vector": [unit_x, unit_y],
+    }
+
+
+def build_player_state(
+    sim: Any,
+    player: int,
+    lawan_01: int,
+    lawan_02: int,
+    ball: int,
+    goal_target_position: list[float],
+    sensor_definitions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    player_position = get_xyz(sim, player)
+    opponent_01_position = get_xyz(sim, lawan_01)
+    opponent_02_position = get_xyz(sim, lawan_02)
+    ball_position = get_xyz(sim, ball)
+
+    player_yaw = get_yaw(sim, player)
+    linear_velocity, angular_velocity = get_actual_velocity(sim, player)
+
+    linear_speed = math.hypot(linear_velocity[0], linear_velocity[1])
+    angular_speed = angular_velocity[2]
+
+    proximity = read_proximity_state(sim, sensor_definitions)
+
+    targets = calculate_player_targets(
+        player_position,
+        ball_position,
+        goal_target_position,
+    )
+
+    along_error, lateral_error = get_line_alignment(
+        player_position,
+        ball_position,
+        goal_target_position,
+    )
+
+    distance_to_ball = dist2d(player_position, ball_position)
+    distance_player_to_goal = dist2d(
+        player_position,
+        goal_target_position,
+    )
+    distance_ball_to_goal = dist2d(
+        ball_position,
+        goal_target_position,
+    )
+
+    goal_heading = math.atan2(
+        goal_target_position[1] - player_position[1],
+        goal_target_position[0] - player_position[0],
+    )
+    face_goal_error = angle_wrap(goal_heading - player_yaw)
+
+    ball_heading = math.atan2(
+        ball_position[1] - player_position[1],
+        ball_position[0] - player_position[0],
+    )
+    face_ball_error = angle_wrap(ball_heading - player_yaw)
+
+    player_is_on_goal_line = (
+        abs(lateral_error) < ALIGN_LATERAL_TOLERANCE
+    )
+    player_is_behind_ball = along_error < -ALIGN_BACK_MIN
+    player_not_too_far = abs(along_error) < ALIGN_BACK_MAX
+
+    ball_in_goal = (
+        abs(ball_position[0] - goal_target_position[0]) < GOAL_CHECK_X
+        and abs(ball_position[1] - goal_target_position[1]) < GOAL_CHECK_Y
+    )
+
+    return {
+        "robot": {
+            "position": player_position,
+            "yaw_rad": player_yaw,
+            "linear_velocity_world": linear_velocity,
+            "angular_velocity_world": angular_velocity,
+            "linear_speed_mps": linear_speed,
+            "angular_speed_radps": angular_speed,
+        },
+        "goal": {
+            "position": goal_target_position.copy(),
+            "distance_from_robot_m": distance_player_to_goal,
+            "distance_from_ball_m": distance_ball_to_goal,
+            "face_goal_error_rad": face_goal_error,
+        },
+        "ball": {
+            "position": ball_position,
+            "distance_from_robot_m": distance_to_ball,
+            "face_ball_error_rad": face_ball_error,
+        },
+        "opponents": {
+            "lawan_01_position": opponent_01_position,
+            "lawan_02_position": opponent_02_position,
+            "distance_to_lawan_01_m": dist2d(
+                player_position,
+                opponent_01_position,
+            ),
+            "distance_to_lawan_02_m": dist2d(
+                player_position,
+                opponent_02_position,
+            ),
+        },
+        "sensor": proximity,
+        "alignment": {
+            "along_error_m": along_error,
+            "lateral_error_m": lateral_error,
+            "is_on_goal_line": player_is_on_goal_line,
+            "is_behind_ball": player_is_behind_ball,
+            "is_not_too_far": player_not_too_far,
+        },
+        "targets": targets,
+        "mission": {
+            "name": "dribble_red_ball_to_yellow_goal",
+            "goal_reached": ball_in_goal,
+        },
+    }
+
+
+# ============================================================
+# 14. DETERMINISTIC FALLBACK DECISION
+# ============================================================
+
+
+def rule_based_player_command(state: dict[str, Any]) -> str:
+    """Used only when LLM inference fails or is unavailable."""
+
+    if state["mission"]["goal_reached"]:
+        return "STOP"
+
+    sensor = state["sensor"]
+
+    if sensor["available"] and sensor["front"] < SENSOR_AVOID_DISTANCE:
+        left_clearance = min(sensor["front_left"], sensor["left"])
+        right_clearance = min(sensor["front_right"], sensor["right"])
+
+        if left_clearance >= right_clearance:
+            return "AVOID_LEFT"
+        return "AVOID_RIGHT"
+
+    distance_to_ball = state["ball"]["distance_from_robot_m"]
+    alignment = state["alignment"]
+
+    if (
+        distance_to_ball < SAFE_BALL_CLEARANCE
+        and not alignment["is_behind_ball"]
+    ):
+        if alignment["lateral_error_m"] >= 0.0:
+            return "APPROACH_SIDE_LEFT"
+        return "APPROACH_SIDE_RIGHT"
+
+    if (
+        not alignment["is_on_goal_line"]
+        or not alignment["is_behind_ball"]
+        or not alignment["is_not_too_far"]
+    ):
+        return "GO_BEHIND_BALL"
+
+    if abs(state["goal"]["face_goal_error_rad"]) > FACE_GOAL_TOLERANCE:
+        return "ALIGN_TO_GOAL"
+
+    return "DRIBBLE_FORWARD"
+
+
+# ============================================================
+# 15. LOCAL LLM INFERENCE
+# ============================================================
+
+
+def make_llm_state_summary(state: dict[str, Any]) -> dict[str, Any]:
+    """Only send compact numeric state to the LLM."""
+
+    return {
+        "mission": state["mission"],
+        "robot_position": state["robot"]["position"][:2],
+        "robot_yaw_rad": state["robot"]["yaw_rad"],
+        "robot_linear_speed_mps": state["robot"]["linear_speed_mps"],
+        "robot_angular_speed_radps": state["robot"][
+            "angular_speed_radps"
+        ],
+        "goal_position": state["goal"]["position"][:2],
+        "distance_robot_to_goal_m": state["goal"][
+            "distance_from_robot_m"
+        ],
+        "distance_ball_to_goal_m": state["goal"][
+            "distance_from_ball_m"
+        ],
+        "face_goal_error_rad": state["goal"]["face_goal_error_rad"],
+        "ball_position": state["ball"]["position"][:2],
+        "distance_robot_to_ball_m": state["ball"][
+            "distance_from_robot_m"
+        ],
+        "face_ball_error_rad": state["ball"]["face_ball_error_rad"],
+        "alignment": state["alignment"],
+        "proximity_sensor_m": state["sensor"],
+        "distance_to_lawan_01_m": state["opponents"][
+            "distance_to_lawan_01_m"
+        ],
+        "distance_to_lawan_02_m": state["opponents"][
+            "distance_to_lawan_02_m"
+        ],
+    }
+
+
+def llm_inference(state: dict[str, Any]) -> dict[str, Any]:
+    start_time = time.monotonic()
+
+    # Keep the instruction short. The model only needs to classify the
+    # current state into one allowed high-level action.
+    system_prompt = (
+        "Control a Pioneer P3DX soccer robot. Return one allowed action. "
+        "Priority: STOP if goal reached; avoid a front obstacle under "
+        "0.30 m toward the clearer side; side-approach when close to the "
+        "ball but not behind it; GO_BEHIND_BALL until alignment is valid; "
+        "ALIGN_TO_GOAL until heading error is within 0.10 rad; otherwise "
+        "DRIBBLE_FORWARD."
+    )
+
+    # Compact JSON reduces prompt-processing time.
+    user_prompt = json.dumps(
+        make_llm_state_summary(state),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+    try:
+        response = chat(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            format=ACTION_SCHEMA,
+            keep_alive=LLM_KEEP_ALIVE,
+            options={
+                "temperature": 0,
+                "num_ctx": LLM_NUM_CTX,
+                "num_predict": LLM_NUM_PREDICT,
+            },
+        )
+
+        result = json.loads(response.message.content)
+        command = str(result.get("action", "STOP"))
+
+        if command not in ALLOWED_PRESET_COMMANDS:
+            raise ValueError(f"Invalid LLM command: {command}")
+
+        return {
+            "type": "preset",
+            "command": command,
+            "reason": f"LLM selected {command} from the latest robot state.",
+            "source": "LLM",
+            "latency_s": time.monotonic() - start_time,
+        }
+
+    except (
+        ResponseError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        ConnectionError,
+    ) as error:
+        fallback_command = rule_based_player_command(state)
+
+        return {
+            "type": "preset",
+            "command": fallback_command,
+            "reason": f"LLM error, deterministic fallback used: {error}",
+            "source": "FALLBACK",
+            "latency_s": time.monotonic() - start_time,
+        }
+
+    except Exception as error:
+        fallback_command = rule_based_player_command(state)
+
+        return {
+            "type": "preset",
+            "command": fallback_command,
+            "reason": f"Unexpected LLM error, fallback used: {error}",
+            "source": "FALLBACK",
+            "latency_s": time.monotonic() - start_time,
+        }
+
+
+# ============================================================
+# 16. NON-BLOCKING LLM WORKER
+# ============================================================
+
+
+class LLMDecisionWorker:
+    """Run model loading and LLM inference outside the 20 Hz loop."""
+
+    def __init__(self) -> None:
+        self.request_queue: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=1
+        )
+        self.result_queue: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=1
+        )
+        self.stop_event = threading.Event()
+        self.ready_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._worker_loop,
+            daemon=True,
+        )
+        self.thread.start()
+
+    def submit(self, state: dict[str, Any]) -> bool:
+        """Keep only the newest state so the LLM never handles stale data."""
+        snapshot = copy.deepcopy(state)
+
+        try:
+            while True:
+                self.request_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        try:
+            self.request_queue.put_nowait(snapshot)
+            return True
+        except queue.Full:
+            return False
+
+    def get_latest_result(self) -> dict[str, Any] | None:
+        latest_result = None
+
+        while True:
+            try:
+                latest_result = self.result_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        return latest_result
+
+    def close(self) -> None:
+        self.stop_event.set()
+
+    def _preload_model(self) -> None:
+        start_time = time.monotonic()
+        try:
+            generate(
+                model=MODEL_NAME,
+                prompt="",
+                keep_alive=LLM_KEEP_ALIVE,
+                options={
+                    "num_ctx": LLM_NUM_CTX,
+                    "num_predict": 1,
+                },
+            )
+            print(
+                f"[LLM] Model {MODEL_NAME} ready in "
+                f"{time.monotonic() - start_time:.2f} s."
+            )
+        except Exception as error:
+            print(f"[LLM] Model preload failed: {error}")
+        finally:
+            self.ready_event.set()
+
+    def _worker_loop(self) -> None:
+        # Model loading occurs in this background thread, so the simulation
+        # and rule-based warm-start action do not have to wait.
+        self._preload_model()
+
+        while not self.stop_event.is_set():
+            try:
+                state = self.request_queue.get(timeout=0.10)
+            except queue.Empty:
+                continue
+
+            result = llm_inference(state)
+
+            try:
+                while True:
+                    self.result_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            try:
+                self.result_queue.put_nowait(result)
+            except queue.Full:
+                pass
+
+
+# ============================================================
+# 17. SAFETY VALIDATION
+# ============================================================
+
+
+def apply_safety_override(
+    state: dict[str, Any],
+    action: dict[str, Any],
+) -> dict[str, Any]:
+    safe_action = copy.deepcopy(action)
+
+    if safe_action.get("type") != "preset":
+        return safe_action
+
+    command = safe_action.get("command", "STOP")
+
+    if command not in ALLOWED_PRESET_COMMANDS:
+        return {
+            "type": "preset",
+            "command": "STOP",
+            "reason": "Invalid command rejected by safety layer.",
+            "source": "SAFETY",
+            "latency_s": safe_action.get("latency_s", 0.0),
+        }
+
+    if state["mission"]["goal_reached"]:
+        return {
+            "type": "preset",
+            "command": "STOP",
+            "reason": "Mission completed: ball reached the yellow goal.",
+            "source": "SAFETY",
+            "latency_s": safe_action.get("latency_s", 0.0),
+        }
+
+    sensor = state["sensor"]
+
+    if sensor["available"] and sensor["front"] <= SENSOR_EMERGENCY_STOP:
+        return {
+            "type": "preset",
+            "command": "STOP",
+            "reason": "Emergency stop: obstacle is too close in front.",
+            "source": "SAFETY",
+            "latency_s": safe_action.get("latency_s", 0.0),
+        }
+
+    forward_related_commands = {
+        "GO_BEHIND_BALL",
+        "DRIBBLE_FORWARD",
+        "APPROACH_SIDE_LEFT",
+        "APPROACH_SIDE_RIGHT",
+    }
+
+    if (
+        sensor["available"]
+        and sensor["front"] < SENSOR_AVOID_DISTANCE
+        and command in forward_related_commands
+    ):
+        left_clearance = min(sensor["front_left"], sensor["left"])
+        right_clearance = min(sensor["front_right"], sensor["right"])
+
+        avoid_command = (
+            "AVOID_LEFT"
+            if left_clearance >= right_clearance
+            else "AVOID_RIGHT"
+        )
+
+        return {
+            "type": "preset",
+            "command": avoid_command,
+            "reason": "Forward action overridden because front path is blocked.",
+            "source": "SAFETY",
+            "latency_s": safe_action.get("latency_s", 0.0),
+        }
+
+    return safe_action
+
+
+# ============================================================
+# 18. STATE-ACTION INTERFACE FOR ROBOT_PEMAIN
+# ============================================================
+
+
+def execute_preset_action(
+    sim: Any,
+    player: int,
+    player_left_motor: int,
+    player_right_motor: int,
+    state: dict[str, Any],
+    command: str,
+) -> None:
+    targets = state["targets"]
+
+    if command == "APPROACH_SIDE_LEFT":
+        drive_to_point(
+            sim,
+            player,
+            player_left_motor,
+            player_right_motor,
+            targets["side_left"],
+            PLAYER_SPEED,
+        )
+
+    elif command == "APPROACH_SIDE_RIGHT":
+        drive_to_point(
+            sim,
+            player,
+            player_left_motor,
+            player_right_motor,
+            targets["side_right"],
+            PLAYER_SPEED,
+        )
+
+    elif command == "GO_BEHIND_BALL":
+        drive_to_point(
+            sim,
+            player,
+            player_left_motor,
+            player_right_motor,
+            targets["behind_ball"],
+            PLAYER_SPEED,
+        )
+
+    elif command == "ALIGN_TO_GOAL":
+        face_point(
+            sim,
+            player,
+            player_left_motor,
+            player_right_motor,
+            state["goal"]["position"],
+            PLAYER_SPEED,
+        )
+
+    elif command == "DRIBBLE_FORWARD":
+        drive_forward_to_point(
+            sim,
+            player,
+            player_left_motor,
+            player_right_motor,
+            targets["push_target"],
+            PLAYER_SPEED,
+        )
+
+    elif command == "AVOID_LEFT":
+        # Preset open-loop body-space Twist.
+        set_diff_drive(
+            sim,
+            player_left_motor,
+            player_right_motor,
+            linear_velocity=0.05,
+            angular_velocity=1.20,
+        )
+
+    elif command == "AVOID_RIGHT":
+        # Preset open-loop body-space Twist.
+        set_diff_drive(
+            sim,
+            player_left_motor,
+            player_right_motor,
+            linear_velocity=0.05,
+            angular_velocity=-1.20,
+        )
+
+    else:
+        stop_robot(sim, player_left_motor, player_right_motor)
+
+
+def robot_interface(
+    sim: Any,
+    player: int,
+    player_left_motor: int,
+    player_right_motor: int,
+    state: dict[str, Any],
+    action: dict[str, Any],
+) -> None:
+    """
+    Single state-action interface between CoppeliaSim and the AI layer.
+
+    Supported action types:
+    1. preset         -> high-level command selected by the LLM
+    2. body_twist     -> linear and angular body-space velocity
+    3. joint_velocity -> direct left and right wheel velocity
+    """
+
+    action_type = action.get("type", "preset")
+
+    if action_type == "preset":
+        execute_preset_action(
+            sim,
+            player,
+            player_left_motor,
+            player_right_motor,
+            state,
+            str(action.get("command", "STOP")),
+        )
+
+    elif action_type == "body_twist":
+        linear_velocity = float(action.get("linear_velocity", 0.0))
+        angular_velocity = float(action.get("angular_velocity", 0.0))
+
+        set_diff_drive(
+            sim,
+            player_left_motor,
+            player_right_motor,
+            linear_velocity,
+            angular_velocity,
+        )
+
+    elif action_type == "joint_velocity":
+        left_wheel_velocity = float(
+            action.get("left_wheel_velocity", 0.0)
+        )
+        right_wheel_velocity = float(
+            action.get("right_wheel_velocity", 0.0)
+        )
+
+        set_joint_velocity(
+            sim,
+            player_left_motor,
+            player_right_motor,
+            left_wheel_velocity,
+            right_wheel_velocity,
+        )
+
+    else:
+        stop_robot(sim, player_left_motor, player_right_motor)
+
+
+# ============================================================
+# 19. RULE-BASED ROBOT_LAWAN_02 GOALKEEPER
+# ============================================================
+
+
+def keeper_control(
+    sim: Any,
+    lawan_02: int,
+    lawan_02_left_motor: int,
+    lawan_02_right_motor: int,
+    yellow_goal_center_position: list[float],
+    keeper_base_x: float,
+    keeper_y_min: float,
+    keeper_y_max: float,
+    keeper_state: dict[str, Any],
+    keeper_direction: int,
+) -> int:
+    lawan_02_position = get_xyz(sim, lawan_02)
+
+    keeper_center_target = [
+        keeper_base_x,
+        yellow_goal_center_position[1],
+    ]
+
+    if keeper_state["mode"] == "face_goal":
+        angle_error = face_point(
+            sim,
+            lawan_02,
+            lawan_02_left_motor,
+            lawan_02_right_motor,
+            yellow_goal_center_position,
+            KEEPER_SPEED,
+        )
+
+        if abs(angle_error) < KEEPER_FACE_ERROR:
+            stop_robot(
+                sim,
+                lawan_02_left_motor,
+                lawan_02_right_motor,
+            )
+            keeper_state["mode"] = "go_to_keeper_center"
+
+        return keeper_direction
+
+    if keeper_state["mode"] == "go_to_keeper_center":
+        drive_to_point(
+            sim,
+            lawan_02,
+            lawan_02_left_motor,
+            lawan_02_right_motor,
+            keeper_center_target,
+            KEEPER_SPEED,
+        )
+
+        if dist2d(lawan_02_position, keeper_center_target) < KEEPER_START_DISTANCE:
+            stop_robot(
+                sim,
+                lawan_02_left_motor,
+                lawan_02_right_motor,
+            )
+            keeper_state["mode"] = "patrol"
+
+        return keeper_direction
+
+    if keeper_direction == 1:
+        keeper_target = [keeper_base_x, keeper_y_max]
+
+        if lawan_02_position[1] > keeper_y_max - KEEPER_PATROL_TOL:
+            keeper_direction = -1
+    else:
+        keeper_target = [keeper_base_x, keeper_y_min]
+
+        if lawan_02_position[1] < keeper_y_min + KEEPER_PATROL_TOL:
+            keeper_direction = 1
+
+    drive_to_point(
+        sim,
+        lawan_02,
+        lawan_02_left_motor,
+        lawan_02_right_motor,
+        keeper_target,
+        KEEPER_SPEED,
+    )
+
+    return keeper_direction
+
+
+# ============================================================
+# 20. RULE-BASED ROBOT_LAWAN_01 RANDOM PATROL
+# ============================================================
+
+
+def update_lawan_01_patrol_target(
+    field_position: list[float],
+    yellow_goal_target_position: list[float],
+    field_y_min: float,
+    field_y_max: float,
+    lawan_01_state: dict[str, Any],
+) -> None:
+    random_y = random.uniform(
+        field_y_min + LAWAN_01_Y_MARGIN,
+        field_y_max - LAWAN_01_Y_MARGIN,
+    )
+
+    if yellow_goal_target_position[0] > field_position[0]:
+        x_left = field_position[0] + 0.30
+        x_right = yellow_goal_target_position[0] - 1.20
+    else:
+        x_left = yellow_goal_target_position[0] + 1.20
+        x_right = field_position[0] - 0.30
+
+    if lawan_01_state["direction"] == 1:
+        lawan_01_state["target"] = [x_right, random_y]
+        lawan_01_state["direction"] = -1
+    else:
+        lawan_01_state["target"] = [x_left, random_y]
+        lawan_01_state["direction"] = 1
+
+
+# ============================================================
+# 21. TERMINAL MONITORING
+# ============================================================
+
+
+def print_llm_decision(
+    state: dict[str, Any],
+    action: dict[str, Any],
+) -> None:
+    sensor = state["sensor"]
+
+    print("\n=== AI LLM DECISION ===")
+    print(
+        f"Source    : {action.get('source', 'UNKNOWN')} | "
+        f"Latency: {action.get('latency_s', 0.0):.3f} s"
+    )
+    print(f"Command   : {action.get('command', 'STOP')}")
+    print(f"Reason    : {action.get('reason', '-')}")
+    print(
+        "Robot     : "
+        f"x={state['robot']['position'][0]:.2f}, "
+        f"y={state['robot']['position'][1]:.2f}, "
+        f"speed={state['robot']['linear_speed_mps']:.3f} m/s"
+    )
+    print(
+        "Ball      : "
+        f"x={state['ball']['position'][0]:.2f}, "
+        f"y={state['ball']['position'][1]:.2f}, "
+        f"distance={state['ball']['distance_from_robot_m']:.2f} m"
+    )
+    print(
+        "Alignment : "
+        f"along={state['alignment']['along_error_m']:.3f}, "
+        f"lateral={state['alignment']['lateral_error_m']:.3f}, "
+        f"behind={state['alignment']['is_behind_ball']}"
+    )
+    print(
+        "Sensor    : "
+        f"available={sensor['available']}, "
+        f"FL={sensor['front_left']:.2f}, "
+        f"F={sensor['front']:.2f}, "
+        f"FR={sensor['front_right']:.2f}, "
+        f"L={sensor['left']:.2f}, "
+        f"R={sensor['right']:.2f}"
+    )
+    print("=======================\n")
+
+
+# ============================================================
+# 22. MAIN PROGRAM
+# ============================================================
+
+
+def main() -> None:
+    client = RemoteAPIClient()
+    sim = client.require("sim")
+
+    print("Connected to CoppeliaSim")
+
+    player = sim.getObject(PLAYER_NAME)
+    lawan_01 = sim.getObject(LAWAN_01_NAME)
+    lawan_02 = sim.getObject(LAWAN_02_NAME)
+
+    ball = sim.getObject(BALL_NAME)
+    field = sim.getObject(FIELD_NAME)
+    yellow_goal = sim.getObject(YELLOW_GOAL_NAME)
+    white_goal = sim.getObject(WHITE_GOAL_NAME)
+
+    player_left_motor, player_right_motor = get_robot_motors(
+        sim,
+        PLAYER_NAME,
+    )
+    lawan_01_left_motor, lawan_01_right_motor = get_robot_motors(
+        sim,
+        LAWAN_01_NAME,
+    )
+    lawan_02_left_motor, lawan_02_right_motor = get_robot_motors(
+        sim,
+        LAWAN_02_NAME,
+    )
+
+    player_sensor_definitions = discover_player_proximity_sensors(
+        sim,
+        player,
+    )
+
+    objects = {
+        "Lapangan": field,
+        "Robot_Pemain": player,
+        "Robot_Lawan_01": lawan_01,
+        "Robot_Lawan_02": lawan_02,
+        "Bola_Merah": ball,
+        "Gawang_Kuning": yellow_goal,
+        "Gawang_Putih": white_goal,
+    }
+
+    initial_positions: dict[str, list[float]] = {}
+    initial_orientations: dict[str, list[float]] = {}
+
+    for name, obj in objects.items():
+        initial_positions[name] = list(
+            sim.getObjectPosition(obj, sim.handle_world)
+        )
+        initial_orientations[name] = list(
+            sim.getObjectOrientation(obj, sim.handle_world)
+        )
+
+    print_initial_positions(sim, objects)
+
+    ball_start = initial_positions["Bola_Merah"]
+    field_position = initial_positions["Lapangan"]
+    yellow_goal_origin_position = initial_positions["Gawang_Kuning"]
+    white_goal_position = initial_positions["Gawang_Putih"]
+
+    yellow_goal_center_position = get_goal_center_from_children(
+        sim,
+        yellow_goal,
+        yellow_goal_origin_position,
+    )
+    yellow_goal_target_position = get_adjusted_goal_target(
+        yellow_goal_center_position
+    )
+
+    field_x_min = min(
+        yellow_goal_target_position[0],
+        white_goal_position[0],
+    ) - 1.0
+    field_x_max = max(
+        yellow_goal_target_position[0],
+        white_goal_position[0],
+    ) + 1.0
+    field_y_min = field_position[1] - 3.2
+    field_y_max = field_position[1] + 3.2
+
+    right_ball_out_limit = field_x_max - RIGHT_OUT_TIGHTEN
+
+    keeper_direction = 1
+    keeper_state = {"mode": "face_goal"}
+
+    lawan_01_state = {
+        "direction": 1,
+        "target": [field_position[0], field_position[1]],
+    }
+
+    update_lawan_01_patrol_target(
+        field_position,
+        yellow_goal_target_position,
+        field_y_min,
+        field_y_max,
+        lawan_01_state,
+    )
+
+    if sim.getSimulationState() == sim.simulation_stopped:
+        sim.startSimulation()
+        time.sleep(1.0)
+
+    llm_worker = LLMDecisionWorker()
+    last_llm_request_time = -float("inf")
+
+    current_action: dict[str, Any] = {
+        "type": "preset",
+        "command": "STOP",
+        "reason": "Waiting for the first local LLM inference.",
+        "source": "INITIAL",
+        "latency_s": 0.0,
+    }
+
+    last_printed_command = None
+
+    try:
+        while True:
+            yellow_goal_center_position = get_goal_center_from_children(
+                sim,
+                yellow_goal,
+                yellow_goal_origin_position,
+            )
+            yellow_goal_target_position = get_adjusted_goal_target(
+                yellow_goal_center_position
+            )
+
+            keeper_base_x = yellow_goal_center_position[0]
+            keeper_y_min = (
+                yellow_goal_center_position[1] - KEEPER_PATROL_RANGE_Y
+            )
+            keeper_y_max = (
+                yellow_goal_center_position[1] + KEEPER_PATROL_RANGE_Y
+            )
+
+            ball_position = get_xyz(sim, ball)
+            lawan_01_position = get_xyz(sim, lawan_01)
+
+            goal_check_x = abs(
+                ball_position[0] - yellow_goal_target_position[0]
+            )
+            goal_check_y = abs(
+                ball_position[1] - yellow_goal_target_position[1]
+            )
+
+            if goal_check_x < GOAL_CHECK_X and goal_check_y < GOAL_CHECK_Y:
+                print("\n[MISI SELESAI] Bola merah masuk gawang kuning.\n")
+
+                stop_robot(
+                    sim,
+                    player_left_motor,
+                    player_right_motor,
+                )
+                stop_robot(
+                    sim,
+                    lawan_01_left_motor,
+                    lawan_01_right_motor,
+                )
+                stop_robot(
+                    sim,
+                    lawan_02_left_motor,
+                    lawan_02_right_motor,
+                )
+
+                time.sleep(5.0)
+
+                reset_game(
+                    sim,
+                    objects,
+                    initial_positions,
+                    initial_orientations,
+                )
+
+                keeper_direction = 1
+                keeper_state["mode"] = "face_goal"
+                lawan_01_state["direction"] = 1
+
+                update_lawan_01_patrol_target(
+                    field_position,
+                    yellow_goal_target_position,
+                    field_y_min,
+                    field_y_max,
+                    lawan_01_state,
+                )
+
+                current_action = {
+                    "type": "preset",
+                    "command": "STOP",
+                    "reason": "Game reset; waiting for new inference.",
+                    "source": "RESET",
+                    "latency_s": 0.0,
+                }
+
+                last_llm_request_time = -float("inf")
+                continue
+
+            ball_is_out = (
+                ball_position[0] < field_x_min - BALL_OUT_MARGIN
+                or ball_position[0]
+                > right_ball_out_limit + BALL_OUT_MARGIN
+                or ball_position[1] < field_y_min - BALL_OUT_MARGIN
+                or ball_position[1] > field_y_max + BALL_OUT_MARGIN
+            )
+
+            if ball_is_out:
+                print("[RESET] Bola keluar lapangan; bola dikembalikan.")
+                reset_ball(
+                    sim,
+                    ball,
+                    ball_start,
+                    initial_orientations["Bola_Merah"],
+                )
+
+            state = build_player_state(
+                sim,
+                player,
+                lawan_01,
+                lawan_02,
+                ball,
+                yellow_goal_target_position,
+                player_sensor_definitions,
+            )
+
+            # Do not leave the player stopped while the local model is loading.
+            # A deterministic command starts the mission immediately; the first
+            # LLM result replaces it as soon as inference is available.
+            if current_action.get("source") in {"INITIAL", "RESET"}:
+                warm_start_command = rule_based_player_command(state)
+                current_action = {
+                    "type": "preset",
+                    "command": warm_start_command,
+                    "reason": (
+                        "Immediate warm-start command while the local LLM "
+                        "prepares its first decision."
+                    ),
+                    "source": "WARM_START",
+                    "latency_s": 0.0,
+                }
+                print_llm_decision(state, current_action)
+                last_printed_command = warm_start_command
+
+            current_time = time.monotonic()
+
+            if (
+                current_time - last_llm_request_time
+                >= LLM_REQUEST_INTERVAL
+            ):
+                submitted = llm_worker.submit(state)
+
+                if submitted:
+                    last_llm_request_time = current_time
+
+            new_llm_action = llm_worker.get_latest_result()
+
+            if new_llm_action is not None:
+                current_action = new_llm_action
+                print_llm_decision(state, current_action)
+                last_printed_command = current_action.get("command")
+
+            safe_action = apply_safety_override(state, current_action)
+
+            if (
+                safe_action.get("command") != last_printed_command
+                and safe_action.get("source") == "SAFETY"
+            ):
+                print(
+                    f"[SAFETY OVERRIDE] "
+                    f"{current_action.get('command')} -> "
+                    f"{safe_action.get('command')} | "
+                    f"{safe_action.get('reason')}"
+                )
+                last_printed_command = safe_action.get("command")
+
+            robot_interface(
+                sim,
+                player,
+                player_left_motor,
+                player_right_motor,
+                state,
+                safe_action,
+            )
+
+            keeper_direction = keeper_control(
+                sim,
+                lawan_02,
+                lawan_02_left_motor,
+                lawan_02_right_motor,
+                yellow_goal_center_position,
+                keeper_base_x,
+                keeper_y_min,
+                keeper_y_max,
+                keeper_state,
+                keeper_direction,
+            )
+
+            if (
+                dist2d(
+                    lawan_01_position,
+                    lawan_01_state["target"],
+                )
+                < LAWAN_01_REACH_TOL
+            ):
+                update_lawan_01_patrol_target(
+                    field_position,
+                    yellow_goal_target_position,
+                    field_y_min,
+                    field_y_max,
+                    lawan_01_state,
+                )
+
+            drive_to_point(
+                sim,
+                lawan_01,
+                lawan_01_left_motor,
+                lawan_01_right_motor,
+                lawan_01_state["target"],
+                PARTICIPATOR_SPEED,
+            )
+
+            time.sleep(CONTROL_DT)
+
+    except KeyboardInterrupt:
+        print("\nProgram dihentikan oleh user.")
+
+    finally:
+        llm_worker.close()
+
+        stop_robot(sim, player_left_motor, player_right_motor)
+        stop_robot(sim, lawan_01_left_motor, lawan_01_right_motor)
+        stop_robot(sim, lawan_02_left_motor, lawan_02_right_motor)
+
+        print("Semua robot dihentikan.")
+
+
+if __name__ == "__main__":
+    main()
